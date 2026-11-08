@@ -1,136 +1,33 @@
-name: Release
+
+name: Build binaries
+
+run-name: Build ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
     tags:
       - "v*.*.*"
 
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (example: v1.4.5)"
+        required: false
+        type: string
+
 permissions:
   contents: read
 
 env:
-  NODE_VERSION: "24"
   ANDROID_NDK_VERSION: "30.0.16248370"
   ANDROID_API_LEVEL: "24"
+  BUILD_REF: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  prepare:
-    name: Prepare Release Metadata
-    runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Verify tag version
-        id: version
-        shell: bash
-        run: |
-          VERSION="$(node .github/scripts/sync_versions.mjs --print-version)"
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-
-          if [[ "$TAG_VERSION" != "$VERSION" ]]; then
-            echo "Release tag version ${TAG_VERSION} does not match workspace version ${VERSION}" >&2
-            exit 1
-          fi
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-  preflight:
-    name: Release Preflight
-    runs-on: ubuntu-24.04
-    needs: prepare
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-
-      - name: Apply temporary custom defaults
-        run: python .github/scripts/apply_custom_defaults.py
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: packages/unluac-js/package-lock.json
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Restore vendored Lua toolchain cache
-        id: lua-toolchain-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: lua/build
-          key: ubuntu-24.04-${{ runner.arch }}-lua-toolchains-v2-${{ hashFiles('xtask/src/toolchain.rs', 'lua/patches/luau/**') }}
-
-      - name: Install Linux Lua build dependencies
-        if: steps.lua-toolchain-cache.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake libreadline-dev
-
-      - name: Build vendored Lua toolchains
-        if: steps.lua-toolchain-cache.outputs.cache-hit != 'true'
-        run: cargo lua init all
-
-      - name: Save vendored Lua toolchain cache
-        if: steps.lua-toolchain-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: lua/build
-          key: ${{ steps.lua-toolchain-cache.outputs.cache-primary-key }}
-
-      - name: Setup WASM tools
-        uses: ./.github/actions/setup-wasm-tools
-
-      - name: Check synced package versions
-        run: node .github/scripts/sync_versions.mjs --check
-
-      - name: Run Rust lint and tests
-        run: |
-          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo case-test --jobs 8
-
-      - name: Dry-run crate publish
-        run: cargo publish -p unluac --locked --dry-run
-
-      - name: Build and pack npm release
-        working-directory: packages/unluac-js
-        run: |
-          npm ci
-          npm run build
-          mkdir -p "${RUNNER_TEMP}/release-package"
-          cp dist/unluac_wasm_bg.wasm "${RUNNER_TEMP}/release-package/unluac_wasm_bg.wasm"
-          cd dist
-          npm pack --pack-destination "${RUNNER_TEMP}/release-package"
-
-      - name: Upload verified npm and WASM package
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-wasm-${{ needs.prepare.outputs.version }}
-          path: ${{ runner.temp }}/release-package/
-          if-no-files-found: error
-
   build-cli:
     name: Build CLI (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
-    needs:
-      - prepare
-      - preflight
+
     strategy:
       fail-fast: false
       matrix:
@@ -163,6 +60,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Python
         uses: actions/setup-python@v7
@@ -185,12 +84,6 @@ jobs:
           set -euo pipefail
 
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-
-          if [[ -z "$SDK_ROOT" ]]; then
-            echo "Android SDK root was not provided by setup-android" >&2
-            exit 1
-          fi
-
           NDK="$SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           LINKER="$TOOLCHAIN/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
@@ -202,155 +95,42 @@ jobs:
 
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$LINKER" >> "$GITHUB_ENV"
           echo "CC_aarch64_linux_android=$LINKER" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
 
-      - name: Setup Rust for native release
+      - name: Setup native Rust
         if: matrix.platform != 'termux-aarch64'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup Rust for Termux ARM64
+      - name: Setup Android Rust target
         if: matrix.platform == 'termux-aarch64'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
-      - name: Build native release binary
+      - name: Build native binary
         if: matrix.platform != 'termux-aarch64'
         run: cargo build -p unluac-cli --release --locked
 
-      - name: Build Termux ARM64 release binary
+      - name: Build Termux ARM64 binary
         if: matrix.platform == 'termux-aarch64'
         run: cargo build -p unluac-cli --release --locked --target aarch64-linux-android
 
-      - name: Rename release binary
+      - name: Prepare binary artifact
         shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          mkdir -p release-assets
-          cp "${{ matrix.binary_path }}" "release-assets/unluac-${VERSION}-${{ matrix.platform }}${{ matrix.extension }}"
+          set -euo pipefail
 
-      - name: Upload CLI artifact
+          mkdir -p release-assets
+
+          cp "${{ matrix.binary_path }}" \
+            "release-assets/unluac-${BUILD_REF}-${{ matrix.platform }}${{ matrix.extension }}"
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cli-${{ matrix.platform }}
+          name: unluac-${{ matrix.platform }}
           path: release-assets/*
-
-  publish-and-release:
-    name: Publish crate, npm and Create Release
-    runs-on: ubuntu-24.04
-    needs:
-      - prepare
-      - preflight
-      - build-cli
-    permissions:
-      contents: write
-      id-token: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-
-      - name: Apply temporary custom defaults
-        run: python .github/scripts/apply_custom_defaults.py
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          registry-url: https://registry.npmjs.org
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Check synced package versions
-        run: node .github/scripts/sync_versions.mjs --check
-
-      - name: Inspect release registry state
-        id: release-state
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          if npm view "unluac-js@${VERSION}" version >/dev/null 2>&1; then
-            echo "npm_published=true" >> "$GITHUB_OUTPUT"
-            echo "npm package unluac-js@${VERSION} is already published"
-          else
-            echo "npm_published=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          if curl --silent --fail "https://crates.io/api/v1/crates/unluac/${VERSION}" >/dev/null; then
-            echo "crate_published=true" >> "$GITHUB_OUTPUT"
-            echo "crate unluac ${VERSION} is already published on crates.io"
-          else
-            echo "crate_published=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download verified npm and WASM package
-        uses: actions/download-artifact@v4
-        with:
-          name: npm-wasm-${{ needs.prepare.outputs.version }}
-          path: ${{ runner.temp }}/release-package
-
-      - name: Publish npm package
-        if: steps.release-state.outputs.npm_published != 'true'
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: npm publish "${RUNNER_TEMP}/release-package/unluac-js-${VERSION}.tgz" --access public
-
-      - name: Publish Rust crate
-        if: steps.release-state.outputs.crate_published != 'true'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        shell: bash
-        run: |
-          set +e
-          OUTPUT="$(cargo publish -p unluac --locked 2>&1)"
-          STATUS=$?
-          set -e
-
-          if [[ $STATUS -eq 0 ]]; then
-            printf '%s\n' "$OUTPUT"
-            exit 0
-          fi
-
-          printf '%s\n' "$OUTPUT"
-
-          if grep -Fq "crate unluac@${VERSION} already exists on crates.io index" <<<"$OUTPUT"; then
-            echo "crate unluac ${VERSION} was already published while this workflow was running; continuing"
-            exit 0
-          fi
-
-          exit "$STATUS"
-
-      - name: Download CLI artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: cli-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/release-assets
-
-      - name: Add wasm release asset
-        shell: bash
-        run: |
-          cp "${RUNNER_TEMP}/release-package/unluac_wasm_bg.wasm" "${RUNNER_TEMP}/release-assets/unluac_wasm_bg.wasm"
-
-      - name: Create or update GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --generate-notes
-          fi
-
-          gh release upload "$TAG" "${{ runner.temp }}/release-assets"/* --clobber
+          if-no-files-found: error
+          retention-days: 14
