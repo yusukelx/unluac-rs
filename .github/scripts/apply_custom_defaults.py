@@ -1,59 +1,90 @@
 from pathlib import Path
-import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def replace_exact(content, old, new, expected_count, label):
+def replace_count(content, old, new, expected, label):
     old_count = content.count(old)
     new_count = content.count(new)
-    if new_count == expected_count:
-        return content, False
-    if old_count == expected_count:
+
+    if old_count == expected:
         return content.replace(old, new), True
+
+    if old_count == 0 and new_count == expected:
+        return content, False
+
     raise RuntimeError(
-        f"{label}: expected {expected_count} old occurrence(s), found {old_count}. "
-        "The upstream source may have changed; refusing to patch an unknown layout."
+        f"{label}: expected {expected} occurrence(s), "
+        f"found {old_count} old and {new_count} updated."
     )
 
 
-def patch_file(path, replacements, changed_files):
-    absolute_path = ROOT / path
-    if not absolute_path.is_file():
-        raise FileNotFoundError(f"Required source file not found: {path}")
+def require(content, value, label):
+    if value not in content:
+        raise RuntimeError(f"Verification failed: {label}")
 
-    original = absolute_path.read_text(encoding="utf-8")
-    content = original
-    labels = []
 
-    for old, new, expected_count, label in replacements:
-        content, changed = replace_exact(
-            content, old, new, expected_count, f"{path}: {label}"
+def read_file(relative):
+    path = ROOT / relative
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Required file not found: {relative}")
+
+    return path.read_text(encoding="utf-8")
+
+
+def patch_file(relative, rules):
+    content = read_file(relative)
+
+    for old, new, expected, label in rules:
+        content, _ = replace_count(
+            content,
+            old,
+            new,
+            expected,
+            label,
         )
-        if changed:
-            labels.append(label)
-
-    if content != original:
-        changed_files[path] = content
-        print(f"[updated] {path}: {', '.join(labels)}")
-    else:
-        print(f"[unchanged] {path}: custom defaults already applied")
 
     return content
 
 
-def require_text(content, needle, label):
-    if needle not in content:
-        raise RuntimeError(f"Validation failed: {label}")
+def verify_expanded_indent(expression):
+    start = expression.find("TableStyle::Expanded => Doc::concat([")
+    end = expression.find(
+        "TableStyle::Aligned => unreachable!",
+        start,
+    )
+
+    if start < 0 or end < 0:
+        raise RuntimeError("Could not locate Expanded table emitter")
+
+    block = expression[start:end]
+
+    required = [
+        "Doc::indent(Doc::concat([",
+        "Doc::line(),",
+        "Doc::join(field_docs,",
+    ]
+
+    positions = [block.find(value) for value in required]
+
+    if any(position < 0 for position in positions):
+        raise RuntimeError(
+            "Expanded table indentation is not the expected fixed version."
+        )
+
+    if positions != sorted(positions):
+        raise RuntimeError("Expanded table indentation is incorrect.")
+
+    print("[verified] Expanded table indentation")
 
 
 def main():
     changed_files = {}
 
-    options_path = "src/decompile/options.rs"
-    options = patch_file(
-        options_path,
+    decompile = patch_file(
+        "src/decompile/options.rs",
         [
             (
                 "mode: ParseMode::Permissive,",
@@ -68,24 +99,23 @@ def main():
                 "heuristic naming default",
             ),
         ],
-        changed_files,
     )
+    changed_files["src/decompile/options.rs"] = decompile
 
-    naming_path = "src/ast/naming/common.rs"
     naming = patch_file(
-        naming_path,
+        "src/ast/naming/common.rs",
         [
             (
-                "    #[default]\n    Simple,",
-                "    Simple,",
+                "    #[default]\n"
+                "    Simple,\n"
+                "    /// 在通用策略上利用表达式形状、字段用途和调用线索推断名字。\n"
+                "    Heuristic,",
+                "    Simple,\n"
+                "    /// 在通用策略上利用表达式形状、字段用途和调用线索推断名字。\n"
+                "    #[default]\n"
+                "    Heuristic,",
                 1,
                 "NamingMode default variant",
-            ),
-            (
-                "\n    Heuristic,\n}",
-                "\n    #[default]\n    Heuristic,\n}",
-                1,
-                "NamingMode heuristic default marker",
             ),
             (
                 "            mode: NamingMode::Simple,",
@@ -94,52 +124,57 @@ def main():
                 "NamingOptions default",
             ),
         ],
-        changed_files,
     )
+    changed_files["src/ast/naming/common.rs"] = naming
 
-    generate_path = "src/generate/common.rs"
     generate = patch_file(
-        generate_path,
+        "src/generate/common.rs",
         [
             (
-                "    Compact,\n    #[default]\n    Balanced,\n    Aligned,\n    Expanded,",
-                "    Compact,\n    Balanced,\n    Aligned,\n    #[default]\n    Expanded,",
+                "    Compact,\n"
+                "    #[default]\n"
+                "    Balanced,\n"
+                "    Aligned,\n"
+                "    Expanded,",
+                "    Compact,\n"
+                "    Balanced,\n"
+                "    Aligned,\n"
+                "    #[default]\n"
+                "    Expanded,",
                 1,
-                "Expanded table-style default variant",
+                "TableStyle default variant",
             ),
             (
                 "            table_style: TableStyle::Balanced,",
                 "            table_style: TableStyle::Expanded,",
                 1,
-                "expanded table-style default",
+                "expanded table default",
             ),
             (
                 "            comment: true,",
                 "            comment: false,",
                 1,
-                "disable generated comments by default",
+                "disable generated comments",
             ),
         ],
-        changed_files,
     )
+    changed_files["src/generate/common.rs"] = generate
 
-    cli_path = "packages/unluac-cli/src/cli/args.rs"
     cli = patch_file(
-        cli_path,
+        "packages/unluac-cli/src/cli/args.rs",
         [
             (
                 "        options.generate.mode = self.generate_mode.unwrap_or(GenerateMode::Permissive);",
                 "        set_if_some(&mut options.generate.mode, self.generate_mode);",
                 1,
-                "respect core GenerateMode default",
+                "preserve core GenerateMode default",
             ),
         ],
-        changed_files,
     )
+    changed_files["packages/unluac-cli/src/cli/args.rs"] = cli
 
-    wasm_path = "packages/unluac-wasm/src/lib.rs"
     wasm = patch_file(
-        wasm_path,
+        "packages/unluac-wasm/src/lib.rs",
         [
             (
                 "fn default_wasm_decompile_options() -> DecompileOptions {\n"
@@ -151,101 +186,161 @@ def main():
                 "    DecompileOptions::default()\n"
                 "}",
                 1,
-                "remove wasm permissive override",
+                "remove WASM permissive override",
             ),
         ],
-        changed_files,
     )
+    changed_files["packages/unluac-wasm/src/lib.rs"] = wasm
 
-    web_path = "packages/unluac-web/src/stores/settings.ts"
     web = patch_file(
-        web_path,
+        "packages/unluac-web/src/stores/settings.ts",
         [
             (
                 "const STORAGE_KEY = 'unluac-settings'",
                 "const STORAGE_KEY = 'unluac-settings-v2'",
                 1,
-                "migrate saved browser settings to new defaults",
+                "migrate saved browser settings",
             ),
             (
                 "mode: 'permissive',",
                 "mode: 'strict',",
                 2,
-                "strict parse and generate defaults",
+                "strict web defaults",
             ),
             (
                 "mode: 'debug-like',",
                 "mode: 'heuristic',",
                 1,
-                "heuristic naming default",
+                "heuristic web naming",
             ),
             (
                 "tableStyle: 'balanced',",
                 "tableStyle: 'expanded',",
                 1,
-                "expanded table-style default",
+                "expanded web tables",
             ),
             (
                 "comment: true,",
                 "comment: false,",
                 1,
-                "disable generated comments by default",
+                "disable web comments",
             ),
         ],
-        changed_files,
     )
+    changed_files["packages/unluac-web/src/stores/settings.ts"] = web
 
-    expression_path = ROOT / "src/generate/emit/expr.rs"
-    if not expression_path.is_file():
-        raise FileNotFoundError("Required source file not found: src/generate/emit/expr.rs")
-    expression = expression_path.read_text(encoding="utf-8")
-    start = expression.find("TableStyle::Expanded => Doc::concat([")
-    end = expression.find("TableStyle::Aligned", start)
-    if start < 0 or end < 0:
-        raise RuntimeError("Could not locate the Expanded table emitter")
-    expanded_block = expression[start:end]
-    if not re.search(
-        r"Doc::indent\(Doc::concat\(\[\s*Doc::line\(\),\s*Doc::join\(field_docs",
-        expanded_block,
-        re.DOTALL,
-    ):
-        raise RuntimeError(
-            "Expanded table indentation is not the expected fixed version; "
-            "refusing to compile with an unverified layout."
-        )
-    print("[verified] Expanded table first-entry indentation is already fixed")
+    parser = read_file("src/parser/options.rs")
+    expression = read_file("src/generate/emit/expr.rs")
 
-    require_text(options, "mode: ParseMode::Strict,", "core parser must default to strict")
-    require_text(options, "mode: NamingMode::Heuristic,", "core naming must default to heuristic")
-    require_text(
-        options,
+    require(
+        parser,
+        "#[default]\n    Strict,",
+        "parser strict enum default",
+    )
+    require(
+        decompile,
+        "mode: ParseMode::Strict,",
+        "pipeline strict parser default",
+    )
+    require(
+        decompile,
         "string_decode_mode: StringDecodeMode::Strict,",
-        "string decoding must remain strict",
+        "strict string decoding",
     )
-    require_text(naming, "#[default]\n    Heuristic,", "Heuristic must be NamingMode's default")
-    require_text(generate, "mode: GenerateMode::Strict,", "core generation must remain strict")
-    require_text(generate, "table_style: TableStyle::Expanded,", "core tables must default to Expanded")
-    require_text(generate, "comment: false,", "core comments must be disabled by default")
-    require_text(
+    require(
+        naming,
+        "#[default]\n    Heuristic,",
+        "heuristic naming enum default",
+    )
+    require(
+        decompile,
+        "mode: NamingMode::Heuristic,",
+        "pipeline heuristic naming default",
+    )
+    require(
+        naming,
+        "debug_like_include_function: true,",
+        "debug-like function naming option",
+    )
+    require(
+        generate,
+        "mode: GenerateMode::Strict,",
+        "strict generation default",
+    )
+    require(
+        generate,
+        "table_style: TableStyle::Expanded,",
+        "expanded table default",
+    )
+    require(
+        generate,
+        "#[default]\n    Expanded,",
+        "expanded table enum default",
+    )
+    require(
+        generate,
+        "comment: false,",
+        "generated comments disabled",
+    )
+    require(
         cli,
         "set_if_some(&mut options.generate.mode, self.generate_mode);",
-        "CLI must preserve the core generation default",
+        "CLI respects core generation defaults",
     )
-    require_text(wasm, "fn default_wasm_decompile_options() -> DecompileOptions {\n    DecompileOptions::default()", "WASM must use core defaults")
-    require_text(web, "const STORAGE_KEY = 'unluac-settings-v2'", "web settings key must be migrated")
-    require_text(web, "mode: 'strict',", "web parse/generate defaults must be strict")
-    require_text(web, "mode: 'heuristic',", "web naming default must be heuristic")
-    require_text(web, "tableStyle: 'expanded',", "web tables must default to Expanded")
-    require_text(web, "comment: false,", "web comments must be disabled by default")
+    require(
+        wasm,
+        "fn default_wasm_decompile_options() -> DecompileOptions {\n"
+        "    DecompileOptions::default()\n}",
+        "WASM respects core defaults",
+    )
+    require(
+        web,
+        "const STORAGE_KEY = 'unluac-settings-v2'",
+        "web settings migration",
+    )
+    require(
+        web,
+        "mode: 'strict',",
+        "web strict defaults",
+    )
+    require(
+        web,
+        "mode: 'heuristic',",
+        "web heuristic default",
+    )
+    require(
+        web,
+        "tableStyle: 'expanded',",
+        "web expanded table default",
+    )
+    require(
+        web,
+        "comment: false,",
+        "web comments disabled",
+    )
 
-    for relative_path, content in changed_files.items():
-        (ROOT / relative_path).write_text(content, encoding="utf-8", newline="\n")
+    verify_expanded_indent(expression)
 
-    if changed_files:
-        print(f"Applied temporary defaults to {len(changed_files)} source file(s).")
+    changed = []
+
+    for relative, content in changed_files.items():
+        path = ROOT / relative
+        original = path.read_text(encoding="utf-8")
+
+        if content != original:
+            path.write_text(content, encoding="utf-8")
+            changed.append(relative)
+
+    if changed:
+        print(f"Applied custom defaults to {len(changed)} file(s):")
+
+        for relative in changed:
+            print(f"  - {relative}")
     else:
-        print("All temporary defaults were already applied; no files changed.")
-    print("No Git commit or push was created. Changes exist only in this runner workspace.")
+        print("All custom defaults are already applied.")
+
+    print("No Git commit or push was created.")
+    print("Changes exist only in the current runner workspace.")
 
 
 if __name__ == "__main__":
@@ -254,4 +349,3 @@ if __name__ == "__main__":
     except Exception as error:
         print(f"[apply_custom_defaults] ERROR: {error}", file=sys.stderr)
         raise SystemExit(1)
-      
