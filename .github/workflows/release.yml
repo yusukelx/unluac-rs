@@ -1,19 +1,20 @@
 
-name: Build binaries
+name: Build and Release
 
-run-name: Build ${{ inputs.tag || github.ref_name }}
+run-name: Build ${{ github.event.inputs.tag || github.ref_name }}
 
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v1.4.5"
 
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (example: v1.4.5)"
-        required: false
+        description: "Version to build and release"
+        required: true
         type: string
+        default: "v1.4.5"
 
 permissions:
   contents: read
@@ -21,12 +22,48 @@ permissions:
 env:
   ANDROID_NDK_VERSION: "30.0.16248370"
   ANDROID_API_LEVEL: "24"
-  BUILD_REF: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  prepare:
+    name: Prepare version
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          EXPECTED_TAG="v${VERSION}"
+
+          if [[ "$RELEASE_TAG" != "$EXPECTED_TAG" ]]; then
+            echo "Expected tag: $EXPECTED_TAG"
+            echo "Received tag: $RELEASE_TAG"
+            exit 1
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Building version $RELEASE_TAG"
+
   build-cli:
     name: Build CLI (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
+    needs: prepare
+
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
 
     strategy:
       fail-fast: false
@@ -61,7 +98,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.sha }}
 
       - name: Setup Python
         uses: actions/setup-python@v7
@@ -77,13 +114,19 @@ jobs:
         with:
           packages: "ndk;30.0.16248370"
 
-      - name: Configure Android NDK linker
+      - name: Configure Android linker
         if: matrix.platform == 'termux-aarch64'
         shell: bash
         run: |
           set -euo pipefail
 
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "Android SDK not found" >&2
+            exit 1
+          fi
+
           NDK="$SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           LINKER="$TOOLCHAIN/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
@@ -103,7 +146,7 @@ jobs:
         if: matrix.platform != 'termux-aarch64'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup Android Rust target
+      - name: Setup Termux Rust target
         if: matrix.platform == 'termux-aarch64'
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -117,7 +160,7 @@ jobs:
         if: matrix.platform == 'termux-aarch64'
         run: cargo build -p unluac-cli --release --locked --target aarch64-linux-android
 
-      - name: Prepare binary artifact
+      - name: Prepare binary
         shell: bash
         run: |
           set -euo pipefail
@@ -125,12 +168,79 @@ jobs:
           mkdir -p release-assets
 
           cp "${{ matrix.binary_path }}" \
-            "release-assets/unluac-${BUILD_REF}-${{ matrix.platform }}${{ matrix.extension }}"
+            "release-assets/unluac-${RELEASE_TAG}-${{ matrix.platform }}${{ matrix.extension }}"
 
-      - name: Upload binary artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: unluac-${{ matrix.platform }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 14
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-24.04
+    needs:
+      - prepare
+      - build-cli
+
+    permissions:
+      contents: write
+
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unluac-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-assets
+
+      - name: Verify existing tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+
+            TAG_COMMIT="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+
+            if [[ "$TAG_COMMIT" != "$GITHUB_SHA" ]]; then
+              echo "The existing tag points to a different commit." >&2
+              echo "Tag commit: $TAG_COMMIT" >&2
+              echo "Build commit: $GITHUB_SHA" >&2
+              exit 1
+            fi
+          else
+            echo "Tag does not exist yet. It will be created with the release."
+          fi
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ASSETS="${RUNNER_TEMP}/release-assets"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ASSETS"/* --clobber
+            gh release edit "$RELEASE_TAG" --draft=false \
+              --title "unluac $RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" "$ASSETS"/* \
+              --title "unluac $RELEASE_TAG" \
+              --generate-notes \
+              --target "$GITHUB_SHA"
+          fi
