@@ -10,6 +10,8 @@ permissions:
 
 env:
   NODE_VERSION: "24"
+  ANDROID_NDK_VERSION: "30.0.16248370"
+  ANDROID_API_LEVEL: "24"
 
 jobs:
   prepare:
@@ -47,6 +49,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Apply temporary custom defaults
+        run: python .github/scripts/apply_custom_defaults.py
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -129,27 +139,91 @@ jobs:
             platform: linux-x86_64
             binary_path: target/release/unluac-cli
             extension: ""
+
           - os: windows-2025
             platform: windows-x86_64
             binary_path: target/release/unluac-cli.exe
             extension: ".exe"
+
           - os: macos-15-intel
             platform: macos-x86_64
             binary_path: target/release/unluac-cli
             extension: ""
+
           - os: macos-15
             platform: macos-aarch64
             binary_path: target/release/unluac-cli
             extension: ""
+
+          - os: ubuntu-24.04
+            platform: termux-aarch64
+            binary_path: target/aarch64-linux-android/release/unluac-cli
+            extension: ""
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Apply temporary custom defaults
+        run: python .github/scripts/apply_custom_defaults.py
+
+      - name: Setup Android SDK and NDK
+        if: matrix.platform == 'termux-aarch64'
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "ndk;30.0.16248370"
+
+      - name: Configure Android NDK linker
+        if: matrix.platform == 'termux-aarch64'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "Android SDK root was not provided by setup-android" >&2
+            exit 1
+          fi
+
+          NDK="$SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="$TOOLCHAIN/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+
+          if [[ ! -x "$LINKER" ]]; then
+            echo "Android linker not found: $LINKER" >&2
+            exit 1
+          fi
+
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$LINKER" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$LINKER" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Setup Rust for native release
+        if: matrix.platform != 'termux-aarch64'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
+      - name: Setup Rust for Termux ARM64
+        if: matrix.platform == 'termux-aarch64'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Build native release binary
+        if: matrix.platform != 'termux-aarch64'
         run: cargo build -p unluac-cli --release --locked
+
+      - name: Build Termux ARM64 release binary
+        if: matrix.platform == 'termux-aarch64'
+        run: cargo build -p unluac-cli --release --locked --target aarch64-linux-android
 
       - name: Rename release binary
         shell: bash
@@ -178,6 +252,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Apply temporary custom defaults
+        run: python .github/scripts/apply_custom_defaults.py
 
       - name: Setup Node
         uses: actions/setup-node@v4
