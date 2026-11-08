@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/scripts/apply_custom_defaults.py'
       - 'src/**'
       - 'packages/unluac-wasm/**'
       - 'packages/unluac-web/**'
@@ -28,6 +29,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Apply temporary custom defaults
+        run: python .github/scripts/apply_custom_defaults.py
 
       - name: Setup Node
         uses: actions/setup-node@v4
